@@ -1,7 +1,10 @@
 export type StreamEvent =
   | { type: 'step'; step: string; status: string; label: string }
   | { type: 'plan'; task_type: string; title: string; steps: string[] }
+  | { type: 'agent_action'; action: string; objective: string; sequence: number }
   | { type: 'tool_start' | 'tool_result'; tool: string; status: string; label: string; count?: number }
+  | { type: 'clarification'; code: string; message: string; choices?: { label: string; value: string }[] }
+  | { type: 'warning'; code?: string; message: string; detail?: string }
   | { type: 'itinerary_patch'; days: DayPlan[]; warnings: Warning[] }
   | { type: 'change_proposal'; proposal: TripChangeProposal }
   | { type: 'token'; delta: string }
@@ -12,7 +15,11 @@ export type SourceRecord = {
   provider: string;
   location: string;
   reporttime: string;
-  kind: '实时' | '预报';
+  kind: '实时' | '预报' | '地点' | '路线';
+  resource_id?: string | null;
+  query_time?: string | null;
+  cached?: boolean;
+  detail?: string;
 };
 
 export type ResolvedLocation = {
@@ -34,9 +41,9 @@ export type UserProfile = {
 };
 
 export type POI = { id: string; name: string; type: string; address: string; location: string; longitude?: number | null; latitude?: number | null };
-export type RouteLeg = { origin: string; destination: string; mode: 'walking' | 'transit' | 'driving'; distance_m?: number | null; duration_s?: number | null; summary: string };
-export type Activity = { id: string; date: string; period: 'morning' | 'afternoon' | 'evening'; poi: POI; duration_minutes: number; indoor: boolean; reason: string; route_from_previous?: RouteLeg | null };
-export type DayPlan = { date: string; weather_summary: string; activities: Activity[]; warnings: Warning[]; route_summary: string };
+export type RouteLeg = { origin: string; destination: string; mode: 'walking' | 'transit' | 'driving'; distance_m?: number | null; duration_s?: number | null; summary: string; query_time?: string | null };
+export type Activity = { id: string; date: string; period: 'morning' | 'afternoon' | 'evening'; poi: POI; duration_minutes: number; start_time?: string | null; end_time?: string | null; indoor: boolean; reason: string; route_from_previous?: RouteLeg | null; sources?: SourceRecord[]; data_confidence?: 'verified' | 'partial' | 'estimated' };
+export type DayPlan = { date: string; weather_summary: string; activities: Activity[]; warnings: Warning[]; route_summary: string; sources?: SourceRecord[] };
 export type Warning = { type: string; severity: 'info' | 'warning' | 'error'; message: string; suggestion: string };
 export type TripPlan = { trip_id: string; name: string; request: { destination: string; days: number; pace: string; interests: string[] }; days: DayPlan[]; budget_estimate: string; warnings: Warning[]; version: number; status: string; updated_at?: string | null };
 export type TripMessage = { id?: number; trip_id: string; role: 'user' | 'assistant'; content: string; event_summary: string; created_at?: string | null };

@@ -61,7 +61,11 @@ class SourceRecord(BaseModel):
     provider: str = "高德开放平台"
     location: str
     reporttime: str
-    kind: Literal["实时", "预报"]
+    kind: Literal["实时", "预报", "地点", "路线"]
+    resource_id: str | None = None
+    query_time: str | None = None
+    cached: bool = False
+    detail: str = ""
 
 
 class UserProfile(BaseModel):
@@ -106,6 +110,8 @@ class TripRequest(BaseModel):
     pace: Literal["relaxed", "balanced", "packed"] = "balanced"
     interests: list[str] = Field(default_factory=list, max_length=10)
     transport_mode: Literal["walking", "transit", "driving"] = "transit"
+    transport_preference: str | None = None
+    accommodation_preference: str | None = None
     dietary_restrictions: list[str] = Field(default_factory=list, max_length=10)
     special_needs: list[str] = Field(default_factory=list, max_length=10)
 
@@ -121,6 +127,7 @@ class POI(BaseModel):
     latitude: float | None = None
     tel: str | None = None
     distance: str | None = None
+    source: str = "高德开放平台"
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -132,6 +139,7 @@ class RouteLeg(BaseModel):
     duration_s: int | None = None
     summary: str = ""
     source: str = "高德路径规划"
+    query_time: str | None = None
 
 
 class Activity(BaseModel):
@@ -140,9 +148,13 @@ class Activity(BaseModel):
     period: Literal["morning", "afternoon", "evening"]
     poi: POI
     duration_minutes: int = Field(default=90, ge=30, le=360)
+    start_time: str | None = None
+    end_time: str | None = None
     indoor: bool = False
     reason: str = ""
     route_from_previous: RouteLeg | None = None
+    sources: list[SourceRecord] = Field(default_factory=list)
+    data_confidence: Literal["verified", "partial", "estimated"] = "verified"
 
 
 class ConstraintWarning(BaseModel):
@@ -158,6 +170,7 @@ class DayPlan(BaseModel):
     activities: list[Activity] = Field(default_factory=list, max_length=6)
     warnings: list[ConstraintWarning] = Field(default_factory=list)
     route_summary: str = ""
+    sources: list[SourceRecord] = Field(default_factory=list)
 
 
 class TripPlan(BaseModel):
@@ -191,6 +204,42 @@ class AgentPlan(BaseModel):
     target_day: int | None = Field(default=None, ge=1, le=7)
     requires_confirmation: bool = False
     missing_fields: list[str] = Field(default_factory=list, max_length=5)
+    requirements: dict[str, Any] = Field(default_factory=dict)
+    constraints: list[str] = Field(default_factory=list, max_length=12)
+    planned_steps: list[str] = Field(default_factory=list, max_length=12)
+    action_budget: int = Field(default=8, ge=1, le=12)
+
+
+class AgentAction(BaseModel):
+    tool: Literal[
+        "resolve_location", "weather", "places", "routes", "memory",
+        "trip", "trip_create", "trip_update", "trip_query",
+        "trip_weather_assessment", "finish",
+    ]
+    objective: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolResult(BaseModel):
+    tool: str
+    success: bool
+    data: Any = None
+    sources: list[SourceRecord] = Field(default_factory=list)
+    error_code: str | None = None
+    user_message: str | None = None
+    retryable: bool = False
+
+
+class AgentObservation(BaseModel):
+    action: AgentAction
+    result: ToolResult
+
+
+class ValidationResult(BaseModel):
+    valid: bool = True
+    warnings: list[ConstraintWarning] = Field(default_factory=list)
+    retryable: bool = False
+    affected_days: list[int] = Field(default_factory=list)
 
 
 class UnifiedMessageRequest(BaseModel):
@@ -207,6 +256,24 @@ class TripMessage(BaseModel):
     content: str
     event_summary: str = ""
     created_at: str | None = None
+
+
+class ConversationMessage(BaseModel):
+    id: int | None = None
+    conversation_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    event_summary: str = ""
+    created_at: str | None = None
+
+
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    confirmed_context: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    recent_topics: list[str] = Field(default_factory=list)
+    pending_plan: AgentPlan | None = None
+    updated_at: str | None = None
 
 
 class TripSummary(BaseModel):
@@ -236,3 +303,15 @@ class AgentError(BaseModel):
     stage: str
     message: str
     retryable: bool = False
+
+
+class AgentRunRecord(BaseModel):
+    run_id: str
+    conversation_id: str
+    trip_id: str | None = None
+    intent: str
+    status: Literal["running", "completed", "needs_input", "failed"] = "running"
+    action_count: int = 0
+    error_code: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None

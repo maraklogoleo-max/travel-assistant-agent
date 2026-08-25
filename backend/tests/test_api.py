@@ -13,6 +13,7 @@ def test_health_profile_and_conversation_lifecycle(tmp_path) -> None:
         created = client.post("/api/conversations")
         assert created.status_code == 201
         conversation_id = created.json()["id"]
+        assert client.get(f"/api/conversations/{conversation_id}/messages").json() == []
         assert client.get("/api/profile").json()["temperature_unit"] == "celsius"
         assert client.delete(f"/api/conversations/{conversation_id}").status_code == 204
 

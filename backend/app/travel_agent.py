@@ -1,20 +1,33 @@
+import json
 import re
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Any, TypedDict
-from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from .amap import AmapClient, AmapError
 from .config import Settings
+from .date_parser import parse_target_day, parse_trip_dates
 from .db import ProfileRepository
+from .itinerary_engine import ItineraryEngine
 from .models import (
-    Activity, ConstraintWarning, DayPlan, POI, RouteLeg, TravelProfile, TripPlan,
-    TripRequest, WeatherSnapshot,
+    POI,
+    ConstraintWarning,
+    DayPlan,
+    ResolvedLocation,
+    RouteLeg,
+    SourceRecord,
+    TripPlan,
+    TripRequest,
+    WeatherSnapshot,
 )
+from .tools import TravelToolRegistry
 
 EventEmitter = Callable[[dict[str, Any]], None]
 _emitter: ContextVar[EventEmitter | None] = ContextVar("travel_event_emitter", default=None)
@@ -47,6 +60,13 @@ class TravelState(TypedDict, total=False):
     sources: list[dict[str, Any]]
     replan_count: int
     replan_required: bool
+    routes: list[dict[str, Any]]
+    updated_day: int
+    update_notice: str
+    keep_outdoor: bool
+    outdoor_action: str
+    outdoor_change_count: int
+    no_trip_change: bool
 
 
 class TravelAgent:
@@ -57,6 +77,14 @@ class TravelAgent:
         self.profiles = profiles
         self.amap = amap or AmapClient(settings.amap_api_key, timeout_seconds=settings.amap_timeout_seconds)
         self.timezone = settings.timezone
+        self.tools = TravelToolRegistry(self.amap, settings.timezone)
+        self.itinerary = ItineraryEngine()
+        self.llm: ChatOpenAI | None = None
+        if settings.deepseek_api_key:
+            self.llm = ChatOpenAI(
+                api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url,
+                model=settings.deepseek_model, temperature=0.35, timeout=25, max_retries=1,
+            )
         self.graph = self._build_graph()
 
     def close(self) -> None:
@@ -99,10 +127,8 @@ class TravelAgent:
         match = re.search(r"从([\u4e00-\u9fff]{2,12})到", text)
         if match:
             origin = match.group(1)
-        days = old.days
-        match = re.search(r"(\d+)\s*(?:天|日)", text)
-        if match:
-            days = min(7, max(1, int(match.group(1))))
+        parsed_dates = parse_trip_dates(text, self.timezone)
+        days = parsed_dates.days or old.days
         pace = old.pace
         if re.search(r"轻松|慢节奏|不赶", text):
             pace = "relaxed"
@@ -115,9 +141,11 @@ class TravelAgent:
         elif "步行" in text:
             transport = "walking"
         request = TripRequest(
-            destination=destination, origin=origin, start_date=old.start_date,
+            destination=destination, origin=origin, start_date=parsed_dates.start_date or old.start_date,
             days=days, travelers=old.travelers, budget_level=old.budget_level,
             pace=pace, interests=interests[:10], transport_mode=transport,
+            transport_preference=("高铁" if "高铁" in text else old.transport_preference),
+            accommodation_preference=("民宿" if "民宿" in text else old.accommodation_preference),
             dietary_restrictions=old.dietary_restrictions, special_needs=old.special_needs,
         )
         if not destination:
@@ -130,27 +158,48 @@ class TravelAgent:
 
     def _discover(self, state: TravelState) -> TravelState:
         request = TripRequest.model_validate(state["request"])
+        state_sources = list(state.get("sources", []))
         step("places", "running", "搜索景点、餐饮和备选活动")
         tool("search_places", "running", "正在查找景点和餐饮")
         try:
-            locations = self.amap.resolve_location(request.destination)
-            if not locations:
-                return {"clarification": f"没有找到“{request.destination}”，请补充省份或城市。", "pois": []}
-            location = locations[0]
+            resolved = self.tools.resolve_location(request.destination)
+            if not resolved.success:
+                if resolved.error_code == "LOCATION_AMBIGUOUS":
+                    candidates = [item.get("province", "") + item.get("city", "") + item.get("district", "") for item in (resolved.data or [])]
+                    choices = "、".join(item for item in candidates if item)
+                    return {"clarification": f"“{request.destination}”对应多个地点：{choices}。请告诉我具体地区。", "pois": [], "sources": [item.model_dump(mode="json") for item in resolved.sources]}
+                return {"clarification": resolved.user_message or f"没有找到“{request.destination}”。", "pois": [], "sources": [item.model_dump(mode="json") for item in resolved.sources]}
+            location = ResolvedLocation.model_validate(resolved.data)
             city = location.adcode
             keywords = request.interests or ["景点", "博物馆", "餐饮"]
+            if "亲子" in state["message"]:
+                keywords = ["亲子乐园", "动物园", "科技馆", *keywords]
+            if re.search(r"户外|室外|不怕雨|不介意下雨|坚持户外", state["message"]):
+                keywords = ["景点", "公园", "自然风景", *keywords]
             if "博物馆" not in keywords:
                 keywords.append("博物馆")
-            if "亲子" in state["message"] and "亲子" not in keywords:
-                keywords.append("亲子")
             found: list[POI] = []
             for keyword in keywords[:4]:
-                found.extend(self.amap.search_places(keyword, city=city))
+                result = self.tools.places(keyword, city=city)
+                if result.success:
+                    found.extend(POI.model_validate(item) for item in result.data)
+                    state_sources.extend(item.model_dump(mode="json") for item in result.sources)
+            # Search results commonly include ticket booths, visitor centres
+            # and transport facilities beside a scenic spot.  They are useful
+            # map results but poor primary travel activities.
+            service_poi = re.compile(r"售票|检票|游客中心|服务中心|停车|入口|出口|乘车|观光车|警务|医务|厕所|卫生间|站点?$")
+            food_poi = re.compile(r"麦当劳|肯德基|快餐|餐饮|餐厅|饭店|咖啡|奶茶|小吃|烧烤|火锅|美食")
+            include_food = any(item in request.interests for item in ("美食", "餐饮"))
+            found = [
+                item for item in found
+                if not service_poi.search(item.name)
+                and (include_food or not food_poi.search(f"{item.name} {item.type}"))
+            ]
             unique: dict[str, POI] = {item.id: item for item in found}
             pois = list(unique.values())[:30]
             tool("search_places", "complete", f"高德返回 {len(pois)} 个候选地点", count=len(pois))
             step("places", "complete", "已找到候选地点")
-            return {"pois": [item.model_dump(mode="json") for item in pois]}
+            return {"pois": [item.model_dump(mode="json") for item in pois], "sources": state_sources}
         except AmapError as exc:
             tool("search_places", "error", str(exc))
             step("places", "error", "景点搜索失败")
@@ -158,21 +207,30 @@ class TravelAgent:
 
     def _weather(self, state: TravelState) -> TravelState:
         request = TripRequest.model_validate(state["request"])
+        sources = list(state.get("sources", []))
+        warnings = list(state.get("warnings", []))
         step("weather", "running", "查询行程日期天气")
         tool("get_weather", "running", "正在查询行程天气")
-        if request.days > 3:
-            tool("get_weather", "complete", "超过三天的天气将在临近出发时刷新")
-            step("weather", "complete", "已标记待刷新天气")
-            return {"weather": [], "warnings": [ConstraintWarning(type="weather", severity="info", message="高德基础预报约覆盖三天，后续日期天气待临近出发时刷新。", suggestion="出发前再次查询天气并调整行程。" ).model_dump()]}
-        try:
-            location = self.amap.resolve_location(request.destination)[0]
-            weather = self.amap.get_forecast_weather(location)
-            tool("get_weather", "complete", f"已取得 {len(weather)} 条天气数据")
-            step("weather", "complete", "天气数据已取得")
-            return {"weather": [item.model_dump(mode="json") for item in weather]}
-        except (AmapError, IndexError) as exc:
-            tool("get_weather", "error", str(exc))
-            return {"weather": [], "warnings": [ConstraintWarning(type="weather", message=str(exc)).model_dump()]}
+        resolved = self.tools.resolve_location(request.destination)
+        if not resolved.success:
+            tool("get_weather", "error", resolved.user_message or "地点解析失败")
+            warnings.append(ConstraintWarning(type="weather", message=resolved.user_message or "地点解析失败").model_dump())
+            return {"weather": [], "warnings": warnings, "sources": sources}
+        result = self.tools.weather(ResolvedLocation.model_validate(resolved.data), forecast=True)
+        if not result.success:
+            tool("get_weather", "error", result.user_message or "天气查询失败")
+            warnings.append(ConstraintWarning(type="weather", message=result.user_message or "天气查询失败").model_dump())
+            return {"weather": [], "warnings": warnings, "sources": sources}
+        weather = [WeatherSnapshot.model_validate(item) for item in result.data]
+        sources.extend(item.model_dump(mode="json") for item in result.sources)
+        if request.days > len(weather):
+            warnings.append(ConstraintWarning(
+                type="weather", severity="info",
+                message=f"当前取得 {len(weather)} 天高德预报，其余日期暂不填入天气结论。",
+            ).model_dump())
+        tool("get_weather", "complete", f"已取得 {len(weather)} 条天气数据")
+        step("weather", "complete", "天气数据已取得")
+        return {"weather": [item.model_dump(mode="json") for item in weather], "warnings": warnings, "sources": sources}
 
     def _routes(self, state: TravelState) -> TravelState:
         days = [DayPlan.model_validate(item) for item in state.get("days", [])]
@@ -180,14 +238,18 @@ class TravelAgent:
         step("routes", "running", "计算活动之间的通勤路线")
         tool("plan_routes", "running", "正在计算活动之间的路程")
         routes: list[RouteLeg] = []
+        sources = list(state.get("sources", []))
         failures = 0
         for day in days:
             for previous, current in zip(day.activities, day.activities[1:]):
-                try:
-                    route = self.amap.plan_route(previous.poi, current.poi, request.transport_mode)
+                result = self.tools.route(previous.poi, current.poi, request.transport_mode)
+                if result.success:
+                    route = RouteLeg.model_validate(result.data)
                     current.route_from_previous = route
                     routes.append(route)
-                except AmapError:
+                    current.sources.extend(result.sources)
+                    sources.extend(item.model_dump(mode="json") for item in result.sources)
+                else:
                     failures += 1
         if failures:
             tool("plan_routes", "complete", f"已计算 {len(routes)} 段路线，{failures} 段暂不可用")
@@ -197,26 +259,77 @@ class TravelAgent:
         result: TravelState = {
             "routes": [item.model_dump(mode="json") for item in routes],
             "days": [item.model_dump(mode="json") for item in days],
+            "sources": sources,
         }
         if failures:
-            result["warnings"] = [*state.get("warnings", []), ConstraintWarning(type="route", severity="info", message="部分活动之间暂未取得高德路线耗时，出发前请再次确认。", suggestion="可以切换公交、驾车或减少跨区活动。 ").model_dump()]
+            result["warnings"] = [*state.get("warnings", []), ConstraintWarning(type="route", severity="info", message="部分活动之间暂未取得高德路线耗时，因此没有写入通勤结论。", suggestion="可以切换交通方式或减少跨区活动。").model_dump()]
         return result
 
     def _compose(self, state: TravelState) -> TravelState:
         request = TripRequest.model_validate(state["request"])
         pois = [POI.model_validate(item) for item in state.get("pois", [])]
-        start = request.start_date or datetime.now().date()
-        per_day = {"relaxed": 2, "balanced": 3, "packed": 4}[request.pace]
+        start = request.start_date or datetime.now(ZoneInfo(self.timezone)).date()
         existing = TripPlan.model_validate(state["trip"]).days
-        update_request = bool(existing and re.search(r"换|调整|改成|减少|增加|放慢|雨天|第?[一二三四五六七\d]天", state["message"]))
+        update_request = bool(existing and re.search(
+            r"换|调整|改成|减少|增加|放慢|雨天|户外|室外|多一些|更多|无所谓|不怕雨|不介意下雨|坚持户外|第?[一二三四五六七\d]天",
+            state["message"],
+        ))
         if update_request:
             days = [item.model_copy(deep=True) for item in existing]
-            match = re.search(r"第?([一二三四五六七\d])天", state["message"])
-            mapping = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7}
-            token = match.group(1) if match else "一"
-            target = int(token) if token.isdigit() else mapping.get(token, 1)
+            switch_to_outdoor = bool(re.search(
+                r"(?:室内|博物馆).{0,12}(?:换成|改成|改为|替换(?:成)?).{0,12}(?:户外|室外)|"
+                r"(?:换成|改成|改为|替换(?:成)?).{0,8}(?:户外|室外)",
+                state["message"],
+            ))
+            keep_outdoor = bool(re.search(
+                r"(?:下雨|雨天|降雨).{0,10}(?:也要|仍要|还要|照样|无所谓|没关系|不影响).{0,8}(?:户外|室外)|"
+                r"(?:户外|室外).{0,10}(?:也要|仍要|还要|照样|多一些|不减少)|"
+                r"(?:多一些|更多).{0,6}(?:户外|室外)|(?:不怕雨|不介意下雨|坚持户外)",
+                state["message"],
+            ))
+            if keep_outdoor or switch_to_outdoor:
+                candidates = [
+                    item for item in pois
+                    if re.search(r"风景|公园|湖|森林|自然|景区|山|瀑布|海|沟|景点", item.type + item.name)
+                    and not re.search(r"博物馆|展览|室内|商场|酒店|餐饮|检票|游客中心|服务|售票|乘车|广场|警务|医务|停车|入口|出口", item.type + item.name)
+                ]
+                used = {activity.poi.id for day in days for activity in day.activities if not activity.indoor}
+                changed = 0
+                for day in days:
+                    if keep_outdoor and not switch_to_outdoor and not re.search(r"雨|雪|雷", day.weather_summary):
+                        continue
+                    for activity in day.activities:
+                        if not activity.indoor:
+                            continue
+                        candidate = next((item for item in candidates if item.id not in used), None)
+                        if not candidate:
+                            break
+                        activity.poi = candidate
+                        activity.indoor = False
+                        activity.reason = "按你的要求保留户外活动，即使有降雨也不自动改为室内"
+                        activity.sources = []
+                        used.add(candidate.id)
+                        changed += 1
+                if switch_to_outdoor:
+                    label = f"已将 {changed} 个室内活动换为户外活动" if changed else "没有找到可替换的室内活动"
+                    notice = "已按你的要求将室内活动换为高德返回的户外地点；雨天也不会自动改回室内。" if changed else "当前没有可替换的室内活动，原行程保持不变。"
+                else:
+                    label = f"已按要求保留 {changed} 个户外活动" if changed else "已确认现有活动保持户外"
+                    notice = "雨天也按你的要求保留户外活动；请带好雨具并避开雨势最强时段。"
+                step("itinerary", "complete", label)
+                return {
+                    "days": [item.model_dump(mode="json") for item in days],
+                    "updated_day": 0,
+                    "update_notice": notice,
+                    "keep_outdoor": True,
+                    "outdoor_action": "switch" if switch_to_outdoor else "keep",
+                    "outdoor_change_count": changed,
+                    "no_trip_change": changed == 0,
+                }
+            target = parse_target_day(state["message"]) or 1
             index = min(len(days) - 1, max(0, target - 1))
             day = days[index]
+            update_notice = ""
             if re.search(r"放慢|减少", state["message"]):
                 day.activities = day.activities[: max(1, len(day.activities) - 1)]
             if "亲子" in state["message"]:
@@ -224,6 +337,8 @@ class TravelAgent:
                 if candidate and day.activities:
                     day.activities[0].poi = candidate
                     day.activities[0].reason = "根据亲子偏好局部替换"
+                elif not candidate:
+                    update_notice = "高德暂未返回明确的亲子景点，因此这一天暂时保留原安排。"
             if re.search(r"雨|室内", state["message"]):
                 indoor = [item for item in pois if re.search(r"博物馆|展览|室内|商场", item.type + item.name)]
                 for activity, candidate in zip([item for item in day.activities if not item.indoor], indoor):
@@ -231,41 +346,41 @@ class TravelAgent:
                     activity.indoor = True
                     activity.reason = "根据雨天需求局部替换"
             step("itinerary", "complete", f"已只调整第 {index + 1} 天")
-            return {"days": [item.model_dump(mode="json") for item in days]}
+            return {
+                "days": [item.model_dump(mode="json") for item in days],
+                "updated_day": index + 1,
+                "update_notice": update_notice,
+            }
         if re.search(r"第?二天.*雨|下雨.*第二天", state["message"]):
             indoor = [item for item in pois if re.search(r"博物馆|展览|室内|商场", item.type + item.name)]
             pois = indoor + [item for item in pois if item not in indoor]
         if "亲子" in state["message"]:
             child = [item for item in pois if re.search(r"亲子|乐园|动物|科技", item.type + item.name)]
             pois = child + [item for item in pois if item not in child]
-        days: list[DayPlan] = []
         weather = [WeatherSnapshot.model_validate(item) for item in state.get("weather", [])]
-        for day_index in range(request.days):
-            day = start + timedelta(days=day_index)
-            chosen = pois[day_index * per_day:(day_index + 1) * per_day]
-            activities: list[Activity] = []
-            for index, poi in enumerate(chosen):
-                period = ("morning", "afternoon", "evening")[min(index, 2)]
-                indoor = bool(re.search(r"博物馆|展览|商场|餐厅|室内", poi.type + poi.name))
-                activities.append(Activity(id=str(uuid4()), date=day, period=period, poi=poi, indoor=indoor, reason="符合你的兴趣与行程节奏"))
-            day_weather = next((item for item in weather if item.date == day.isoformat()), None)
-            summary = day_weather.weather if day_weather else "天气待临近日期刷新"
-            days.append(DayPlan(date=day, weather_summary=summary, activities=activities))
+        days, engine_warnings = self.itinerary.build(request, pois, weather, start)
+        source_by_id = {
+            item.resource_id: item
+            for item in (SourceRecord.model_validate(raw) for raw in state.get("sources", []))
+            if item.kind == "地点" and item.resource_id
+        }
+        for day in days:
+            for activity in day.activities:
+                if activity.poi.id in source_by_id:
+                    activity.sources = [source_by_id[activity.poi.id]]
         step("itinerary", "complete", "已生成每日行程")
-        return {"days": [item.model_dump(mode="json") for item in days]}
+        return {
+            "days": [item.model_dump(mode="json") for item in days],
+            "warnings": [*state.get("warnings", []), *[item.model_dump(mode="json") for item in engine_warnings]],
+        }
 
     def _validate(self, state: TravelState) -> TravelState:
         warnings = [ConstraintWarning.model_validate(item) for item in state.get("warnings", []) if item.get("type") != "weather_conflict"]
         days = [DayPlan.model_validate(item) for item in state.get("days", [])]
-        replan_required = False
-        for day in days:
-            if len(day.activities) >= 4:
-                warnings.append(ConstraintWarning(type="pace", severity="warning", message=f"{day.date} 安排了较多活动，可能比较紧凑。", suggestion="可以说“放慢节奏”让我减少活动。"))
-            if day.weather_summary != "天气待临近日期刷新" and re.search(r"雨|雪|雷", day.weather_summary):
-                outdoor = sum(not item.indoor for item in day.activities)
-                if outdoor:
-                    warnings.append(ConstraintWarning(type="weather_conflict", severity="warning", message=f"{day.date} 有降水，当前仍有 {outdoor} 个室外活动。", suggestion="正在尝试替换为室内活动。"))
-                    replan_required = True
+        validation = self.itinerary.validate(days)
+        if not state.get("keep_outdoor", False):
+            warnings.extend(validation.warnings)
+        replan_required = not state.get("keep_outdoor", False) and any(item.type == "weather_conflict" for item in validation.warnings)
         step("validate", "complete", "已完成行程冲突检查")
         return {"warnings": [item.model_dump(mode="json") for item in warnings], "replan_required": replan_required}
 
@@ -307,20 +422,107 @@ class TravelAgent:
         warnings = [ConstraintWarning.model_validate(item) for item in state.get("warnings", [])]
         pace_label = {"relaxed": "轻松", "balanced": "适中", "packed": "充实"}[request.pace]
         period_label = {"morning": "上午", "afternoon": "下午", "evening": "晚上"}
-        lines = [f"我为你安排了一份 {request.destination} {request.days} 天行程，整体节奏{pace_label}："]
-        for day in days:
-            lines.append(f"\n{day.date}｜天气：{day.weather_summary}")
+        updated_day = state.get("updated_day")
+        update_notice = state.get("update_notice")
+        if updated_day == 0:
+            outdoor_action = state.get("outdoor_action")
+            outdoor_change_count = state.get("outdoor_change_count", 0)
+            if outdoor_change_count:
+                lines = ["已按你的要求调整行程，雨天也保留户外活动："]
+            elif outdoor_action == "switch":
+                lines = ["当前没有需要替换的室内活动，行程保持不变："]
+            else:
+                lines = ["当前行程已经保留户外活动："]
+            display_days = days
+        elif updated_day:
+            lines = [f"已调整第 {updated_day} 天，其他日期保持不变："]
+            display_days = [days[updated_day - 1]] if updated_day <= len(days) else []
+        else:
+            lines = [f"好呀，这趟 {request.destination} {request.days} 天行程已经为你排好，整体会保持{pace_label}的节奏。"]
+            if request.origin:
+                transport_label = {"transit": "公共交通", "driving": "自驾", "walking": "步行"}[request.transport_mode]
+                transport_detail = request.transport_preference or transport_label
+                stay_detail = f"，住宿按{request.accommodation_preference}偏好考虑" if request.accommodation_preference else ""
+                lines.append(f"从{request.origin}出发，长途交通优先按{transport_detail}考虑，抵达后以{transport_label}衔接{stay_detail}；不用把每天排得太满，把时间留给沿途的风景。")
+            display_days = days
+        themes = (
+            "第一天先把脚步放慢，熟悉环境，也给旅途留一点余裕。",
+            "这一天把重心放在体验上，慢慢走、慢慢看会更舒服。",
+            "最后一天安排得从容一些，让这段旅程好好收尾。",
+        )
+        previous_weather = None
+        for day_index, day in enumerate(display_days, start=1):
+            weather_label = day.weather_summary if day.weather_summary != previous_weather else "天气与上一天相近"
+            lines.append(f"\n第 {day_index if not updated_day else updated_day} 天 · {day.date}｜天气：{weather_label}")
+            previous_weather = day.weather_summary
+            if not updated_day:
+                lines.append(themes[min(day_index - 1, len(themes) - 1)])
+            if not day.activities:
+                lines.append("- 暂未找到适合的已验证活动。")
             for activity in day.activities:
                 route = f"（从上一站过来约 {activity.route_from_previous.duration_s // 60} 分钟）" if activity.route_from_previous and activity.route_from_previous.duration_s else ""
-                lines.append(f"- {period_label[activity.period]}：{activity.poi.name}{route}。{activity.reason}")
-        lines.append("\n如果想修改，可以直接说“第二天安排室内活动”“换成亲子景点”或“行程轻松一点”。")
+                time_range = f"{activity.start_time}–{activity.end_time} · " if activity.start_time and activity.end_time else ""
+                lines.append(f"- {period_label[activity.period]}：{time_range}{activity.poi.name}{route}")
+        if update_notice:
+            lines.append(f"\n{update_notice}")
         answer = "\n".join(lines)
+        narrated = self._llm_narrative(state, answer)
+        if narrated:
+            answer = narrated
         for index in range(0, len(answer), 8):
             emit({"type": "token", "delta": answer[index:index + 8]})
             time.sleep(0.012)
         emit({"type": "itinerary_patch", "days": [item.model_dump(mode="json") for item in days], "warnings": [item.model_dump(mode="json") for item in warnings]})
         step("answer", "complete", "行程建议已生成")
         return {"answer": answer}
+
+    def _llm_narrative(self, state: TravelState, fallback: str) -> str | None:
+        """Explain verified itinerary facts naturally without inventing facts."""
+        if not self.llm or state.get("clarification"):
+            return None
+        request = TripRequest.model_validate(state["request"])
+        days = [DayPlan.model_validate(item) for item in state.get("days", [])]
+        payload = {
+            "request": {
+                "destination": request.destination, "origin": request.origin,
+                "days": request.days, "pace": request.pace, "interests": request.interests,
+                "transport": request.transport_preference or request.transport_mode,
+                "accommodation": request.accommodation_preference,
+            },
+            "days": [
+                {
+                    "date": item.date.isoformat(), "weather": item.weather_summary,
+                    "activities": [
+                        {
+                            "period": activity.period,
+                            "time": f"{activity.start_time or ''}-{activity.end_time or ''}",
+                            "name": activity.poi.name, "indoor": activity.indoor,
+                            "route_minutes": round(activity.route_from_previous.duration_s / 60)
+                            if activity.route_from_previous and activity.route_from_previous.duration_s else None,
+                        }
+                        for activity in item.activities
+                    ],
+                }
+                for item in days
+            ],
+        }
+        prompt = (
+            "你是一个有判断力、有温度的中文旅行助手。请根据已验证的行程 JSON 写最终答复。"
+            "只能使用 JSON 中出现的地点、日期、天气、时间和路线事实，不能补造景点、价格、营业时间或交通耗时。"
+            "先用一两句说明整体取舍，再按天写安排和理由；每天只写一次天气，避免重复。"
+            "不要提模型、工具、自动规划、思维过程或内部失败，不要加入费用和固定的出发前提醒。"
+            "天气未知时只说‘天气待临近日期刷新’。请使用自然、具体、有画面感的中文。"
+            f"已验证 JSON：{json.dumps(payload, ensure_ascii=False)}"
+        )
+        try:
+            response = self.llm.invoke([SystemMessage(content=prompt), HumanMessage(content=state["message"])])
+            content = response.content if isinstance(response.content, str) else ""
+            content = content.strip()
+            if len(content) < 80 or "麦当劳" in content or "肯德基" in content:
+                return None
+            return content
+        except Exception:  # noqa: BLE001 - retain verified deterministic response
+            return None
 
     def run(
         self, trip_id: str, message: str, emit_callback: EventEmitter | None = None,
@@ -331,15 +533,31 @@ class TravelAgent:
             trip = self.profiles.get_trip(trip_id)
             if not trip:
                 raise ValueError("旅行项目不存在")
-            result = self.graph.invoke({"message": message, "trip": trip.model_dump(mode="json"), "request": trip.request.model_dump(mode="json"), "pois": [], "weather": [], "days": [], "warnings": [], "replan_count": 0, "replan_required": False})
+            result = self.graph.invoke({
+                "message": message, "trip": trip.model_dump(mode="json"),
+                "request": trip.request.model_dump(mode="json"), "pois": [],
+                "weather": [], "days": [], "warnings": [], "sources": [],
+                "routes": [], "replan_count": 0, "replan_required": False,
+            })
             updated = trip.model_copy(update={
                 "request": TripRequest.model_validate(result.get("request", trip.request.model_dump(mode="json"))),
                 "days": [DayPlan.model_validate(item) for item in result.get("days", [])] or trip.days,
                 "warnings": [ConstraintWarning.model_validate(item) for item in result.get("warnings", [])],
                 "status": "needs_input" if result.get("clarification") else "ready",
             })
-            if not result.get("clarification"):
+            if not result.get("clarification") and not result.get("no_trip_change"):
                 self.profiles.save_trip(updated, expected_version=expected_version)
-            return {"answer": result.get("answer", ""), "trip": updated.model_dump(mode="json"), "sources": []}
+            elif result.get("no_trip_change"):
+                updated = trip
+            unique_sources: dict[tuple[str, str | None, str, str], dict[str, Any]] = {}
+            for raw in result.get("sources", []):
+                source = SourceRecord.model_validate(raw)
+                key = (source.kind, source.resource_id, source.location, source.reporttime)
+                unique_sources[key] = source.model_dump(mode="json")
+            return {
+                "answer": result.get("answer", ""),
+                "trip": updated.model_dump(mode="json"),
+                "sources": list(unique_sources.values()),
+            }
         finally:
             _emitter.reset(token)

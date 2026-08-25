@@ -1,6 +1,6 @@
 # 旅游出行小帮手
 
-一个本地中文旅游出行助手：使用 LangGraph 编排任务、DeepSeek 理解需求、高德 Web 服务提供真实天气、地点和路线数据，并用 SQLite 保存可持续修改的行程与用户主动保存的偏好。
+一个本地中文旅游出行智能体：使用 LangGraph 执行“计划—行动—观察—校验”循环，DeepSeek 理解目标和生成结构化计划，高德 Web 服务提供真实天气、地点和路线数据，并用 SQLite 保存可持续修改的行程与用户主动保存的偏好。
 
 ## 主要功能
 
@@ -10,6 +10,8 @@
 - 天气可能影响行程时先展示调整建议，由用户确认后再保存。
 - 保存最近 20 轮行程消息、行程摘要、历史版本和用户明确要求记住的偏好。
 - 支持查看、恢复和永久删除行程。
+- 在安全执行预算内自主选择下一步工具，并根据地点歧义、工具结果和行程校验决定继续、补问或停止。
+- 每个天气、地点和路线结果都携带高德来源、资源标识和查询时间。
 
 ## 技术架构
 
@@ -17,7 +19,7 @@
 | --- | --- | --- |
 | 前端 | React、TypeScript、Vinext | 聊天、行程卡片、状态流和高德交互地图 |
 | 后端 | FastAPI、Pydantic | 统一消息接口、数据校验和 SSE 流式输出 |
-| 任务编排 | LangGraph、DeepSeek | 意图识别、步骤安排、工具选择和上下文理解 |
+| 任务编排 | LangGraph、DeepSeek | 目标识别、结构化规划、受控工具循环和上下文理解 |
 | 数据工具 | 高德 Web 服务 API | 地理编码、天气、POI 搜索和路径规划 |
 | 持久化 | SQLite | 行程、版本、消息、摘要、调整建议和偏好 |
 
@@ -30,6 +32,9 @@ Agent/
 │  │  ├─ main.py              # FastAPI 应用与公开接口
 │  │  ├─ unified_agent.py     # 天气与旅行统一入口
 │  │  ├─ travel_agent.py      # 多日行程编排、路线和天气调整
+│  │  ├─ itinerary_engine.py  # 时间段、区域聚类和约束校验
+│  │  ├─ date_parser.py       # 中文日期、天数和目标日期解析
+│  │  ├─ tools/               # 带类型、错误码和来源的正式工具层
 │  │  ├─ agent.py             # 独立天气查询能力
 │  │  ├─ amap.py              # 高德 API、重试和缓存
 │  │  ├─ db.py                # SQLite 数据访问与版本管理
@@ -40,7 +45,8 @@ Agent/
 │  │  ├─ test_amap.py
 │  │  ├─ test_api.py
 │  │  ├─ test_travel_agent.py
-│  │  └─ test_unified_agent.py
+│  │  ├─ test_unified_agent.py
+│  │  └─ test_date_parser.py
 │  ├─ .env.example            # 后端配置示例，不含真实密钥
 │  └─ pyproject.toml
 ├─ frontend/
@@ -79,7 +85,7 @@ AMAP_WEB_API_KEY=你的高德Web服务API密钥
 如需交互地图，在 `frontend/.env` 中配置：
 
 ```dotenv
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
 NEXT_PUBLIC_AMAP_JS_KEY=你的高德JSAPIKey
 NEXT_PUBLIC_AMAP_SECURITY_CODE=你的高德JSAPI安全密钥
 ```
@@ -103,6 +109,7 @@ NEXT_PUBLIC_AMAP_SECURITY_CODE=你的高德JSAPI安全密钥
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/assistant/messages` | 统一对话入口，以 SSE 返回步骤和回答 |
+| `GET` | `/api/conversations/{id}/messages` | 获取统一对话最近消息 |
 | `GET` | `/api/trips` | 查看已保存行程 |
 | `GET` | `/api/trips/{id}` | 获取最新行程 |
 | `DELETE` | `/api/trips/{id}` | 删除行程及关联数据 |

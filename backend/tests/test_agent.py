@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from app.agent import WeatherAgent
 from app.config import Settings
@@ -29,7 +31,7 @@ class FakeAmap:
         self.calls.append(f"forecast:{location.query}")
         return [WeatherSnapshot(
             location=location, kind="forecast", reporttime="2026-08-25 18:00:00",
-            date="2026-08-26", weather="多云", day_temperature="30", night_temperature="22",
+            date=(datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=1)).date().isoformat(), weather="多云", day_temperature="30", night_temperature="22",
             wind_direction="东", wind_power="3",
         )]
 
@@ -62,7 +64,8 @@ def test_explicit_default_location_persists_across_threads(tmp_path: Path) -> No
     profiles.create_conversation("thread-b")
     second = agent.run("thread-b", "明天呢")
     assert "forecast:成都" in amap.calls
-    assert "2026-08-26" in second["answer"]
+    tomorrow = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=1)).date().isoformat()
+    assert tomorrow in second["answer"]
     agent.close()
 
 

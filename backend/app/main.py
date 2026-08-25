@@ -9,10 +9,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .agent import WeatherAgent
-from .config import Settings, get_settings
 from .amap import AmapError
+from .config import Settings, get_settings
 from .db import ProfileRepository, TripVersionConflict
-from .models import MessageRequest, ProfilePatch, TravelProfile, TripCreateRequest, TripMessage, TripPlan, UnifiedMessageRequest, UserProfile
+from .models import (
+    ConversationMessage,
+    MessageRequest,
+    ProfilePatch,
+    TravelProfile,
+    TripCreateRequest,
+    TripMessage,
+    TripPlan,
+    UnifiedMessageRequest,
+    UserProfile,
+)
 from .travel_agent import TravelAgent
 from .unified_agent import TravelAssistantAgent
 
@@ -33,6 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.travel_agent = TravelAgent(app_settings, profiles)
         app.state.assistant_agent = TravelAssistantAgent(app_settings, profiles, app.state.agent, app.state.travel_agent)
         yield
+        app.state.assistant_agent.close()
         app.state.agent.close()
         app.state.travel_agent.close()
 
@@ -57,6 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "deepseek_configured": bool(app_settings.deepseek_api_key),
             "amap_configured": bool(app_settings.amap_api_key),
             "model": app_settings.deepseek_model,
+            "agent_mode": "controlled_autonomous",
+            "action_budget": 8,
         }
 
     @app.post("/api/conversations", status_code=status.HTTP_201_CREATED)
@@ -71,7 +84,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="对话不存在")
         profiles.delete_conversation(conversation_id)
         await asyncio.to_thread(app.state.agent.delete_thread, conversation_id)
+        await asyncio.to_thread(app.state.assistant_agent.delete_thread, conversation_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get("/api/conversations/{conversation_id}/messages", response_model=list[ConversationMessage])
+    async def get_conversation_messages(conversation_id: str, limit: int = 40) -> list[ConversationMessage]:
+        if not profiles.conversation_exists(conversation_id):
+            raise HTTPException(status_code=404, detail="对话不存在")
+        return profiles.get_conversation_messages(conversation_id, limit)
 
     @app.post("/api/trips", response_model=TripPlan, status_code=status.HTTP_201_CREATED)
     async def create_trip(request: TripCreateRequest) -> TripPlan:

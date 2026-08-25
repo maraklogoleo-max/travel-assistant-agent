@@ -6,8 +6,17 @@ from threading import Lock
 from zoneinfo import ZoneInfo
 
 from .models import (
-    ProfilePatch, TravelProfile, TripChangeProposal, TripMessage, TripPlan,
-    TripRequest, TripSummary, UserProfile,
+    AgentRunRecord,
+    ConversationMessage,
+    ConversationSummary,
+    ProfilePatch,
+    TravelProfile,
+    TripChangeProposal,
+    TripMessage,
+    TripPlan,
+    TripRequest,
+    TripSummary,
+    UserProfile,
 )
 
 
@@ -59,6 +68,27 @@ class ProfileRepository:
                 CREATE TABLE IF NOT EXISTS conversation_context (
                     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
                     last_locations TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    event_summary TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                    summary_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -130,8 +160,37 @@ class ProfileRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_runs (
+                    run_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    trip_id TEXT REFERENCES trips(id) ON DELETE SET NULL,
+                    intent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    action_count INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_tool_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+                    tool TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_trip_messages_trip_id ON trip_messages(trip_id, id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_trip_proposals_trip_id ON trip_change_proposals(trip_id, status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_messages_id ON conversation_messages(conversation_id, id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation ON agent_runs(conversation_id, created_at)")
             connection.execute("PRAGMA optimize")
 
     def _now(self) -> str:
@@ -234,6 +293,62 @@ class ProfileRepository:
                 "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
             ).fetchone() is not None
 
+    def add_conversation_message(
+        self, conversation_id: str, role: str, content: str, event_summary: str = "",
+    ) -> ConversationMessage:
+        now = self._now()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO conversation_messages (conversation_id, role, content, event_summary, created_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, role, content, event_summary, now),
+            )
+            old_rows = connection.execute(
+                "SELECT id, content, event_summary FROM conversation_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT -1 OFFSET 40",
+                (conversation_id,),
+            ).fetchall()
+            if old_rows:
+                summary_row = connection.execute(
+                    "SELECT summary_json FROM conversation_summaries WHERE conversation_id = ?", (conversation_id,)
+                ).fetchone()
+                summary = ConversationSummary.model_validate(json.loads(summary_row["summary_json"])) if summary_row else ConversationSummary(conversation_id=conversation_id)
+                compacted = [row["event_summary"] or row["content"][:80] for row in reversed(old_rows)]
+                summary.recent_topics = (summary.recent_topics + compacted)[-20:]
+                summary.updated_at = now
+                connection.execute(
+                    "INSERT INTO conversation_summaries (conversation_id, summary_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET summary_json=excluded.summary_json, updated_at=excluded.updated_at",
+                    (conversation_id, json.dumps(summary.model_dump(mode="json"), ensure_ascii=False), now),
+                )
+                connection.executemany("DELETE FROM conversation_messages WHERE id = ?", [(row["id"],) for row in old_rows])
+        return ConversationMessage(
+            id=cursor.lastrowid, conversation_id=conversation_id, role=role,
+            content=content, event_summary=event_summary, created_at=now,
+        )
+
+    def get_conversation_messages(self, conversation_id: str, limit: int = 40) -> list[ConversationMessage]:
+        limit = max(1, min(40, limit))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM (SELECT * FROM conversation_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                (conversation_id, limit),
+            ).fetchall()
+        return [ConversationMessage(**dict(row)) for row in rows]
+
+    def get_conversation_summary(self, conversation_id: str) -> ConversationSummary:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT summary_json FROM conversation_summaries WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()
+        return ConversationSummary.model_validate(json.loads(row["summary_json"])) if row else ConversationSummary(conversation_id=conversation_id)
+
+    def save_conversation_summary(self, summary: ConversationSummary) -> ConversationSummary:
+        summary.updated_at = self._now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO conversation_summaries (conversation_id, summary_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET summary_json=excluded.summary_json, updated_at=excluded.updated_at",
+                (summary.conversation_id, json.dumps(summary.model_dump(mode="json"), ensure_ascii=False), summary.updated_at),
+            )
+        return summary
+
     def create_trip(self, trip_id: str, request: TripRequest, plan: TripPlan) -> TripPlan:
         now = self._now()
         plan.updated_at = now
@@ -326,9 +441,20 @@ class ProfileRepository:
                 (trip_id, role, content, event_summary, now),
             )
             rows = connection.execute(
-                "SELECT id FROM trip_messages WHERE trip_id = ? ORDER BY id DESC LIMIT -1 OFFSET 40", (trip_id,)
+                "SELECT id, content, event_summary FROM trip_messages WHERE trip_id = ? ORDER BY id DESC LIMIT -1 OFFSET 40", (trip_id,)
             ).fetchall()
             if rows:
+                summary_row = connection.execute(
+                    "SELECT summary_json FROM trip_summaries WHERE trip_id = ?", (trip_id,)
+                ).fetchone()
+                summary = TripSummary.model_validate(json.loads(summary_row["summary_json"])) if summary_row else TripSummary(trip_id=trip_id)
+                compacted = [row["event_summary"] or row["content"][:80] for row in reversed(rows)]
+                summary.recent_changes = (summary.recent_changes + compacted)[-20:]
+                summary.updated_at = now
+                connection.execute(
+                    "INSERT INTO trip_summaries (trip_id, summary_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(trip_id) DO UPDATE SET summary_json=excluded.summary_json, updated_at=excluded.updated_at",
+                    (trip_id, json.dumps(summary.model_dump(mode="json"), ensure_ascii=False), now),
+                )
                 connection.executemany("DELETE FROM trip_messages WHERE id = ?", [(row["id"],) for row in rows])
         return TripMessage(id=cursor.lastrowid, trip_id=trip_id, role=role, content=content, event_summary=event_summary, created_at=now)
 
@@ -381,3 +507,30 @@ class ProfileRepository:
     def update_proposal_status(self, proposal_id: str, status: str) -> None:
         with self._lock, self._connect() as connection:
             connection.execute("UPDATE trip_change_proposals SET status = ? WHERE proposal_id = ?", (status, proposal_id))
+
+    def create_agent_run(self, record: AgentRunRecord) -> AgentRunRecord:
+        now = self._now()
+        record.created_at = now
+        record.updated_at = now
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO agent_runs (run_id, conversation_id, trip_id, intent, status, action_count, error_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (record.run_id, record.conversation_id, record.trip_id, record.intent, record.status, record.action_count, record.error_code, now, now),
+            )
+        return record
+
+    def update_agent_run(
+        self, run_id: str, *, status: str, action_count: int, error_code: str | None = None,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE agent_runs SET status = ?, action_count = ?, error_code = ?, updated_at = ? WHERE run_id = ?",
+                (status, action_count, error_code, self._now(), run_id),
+            )
+
+    def add_tool_call(self, run_id: str, tool: str, success: bool, result: dict) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO agent_tool_calls (run_id, tool, success, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (run_id, tool, int(success), json.dumps(result, ensure_ascii=False), self._now()),
+            )

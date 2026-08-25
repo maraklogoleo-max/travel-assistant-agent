@@ -37,4 +37,15 @@ describe('consumeSse', () => {
     expect(result.events[0]).toMatchObject({ type: 'change_proposal', proposal: { proposal_id: 'p1' } });
     expect(result.events[1]).toMatchObject({ type: 'final', trip: { version: 2 }, conversation_id: 'c1' });
   });
+
+  it('parses autonomous actions, clarification choices and provenance', () => {
+    const result = consumeSse(
+      'data: {"type":"agent_action","action":"resolve_location","objective":"确认目的地","sequence":1}\n\n' +
+      'data: {"type":"clarification","code":"LOCATION_AMBIGUOUS","message":"请选择地点","choices":[{"label":"北京市朝阳区","value":"北京市朝阳区"}]}\n\n' +
+      'data: {"type":"final","answer":"请选择地点","sources":[{"provider":"高德开放平台","location":"北京市朝阳区","kind":"地点","reporttime":"2026-08-25","resource_id":"110105"}]}\n\n',
+    );
+    expect(result.events[0]).toMatchObject({ type: 'agent_action', action: 'resolve_location', sequence: 1 });
+    expect(result.events[1]).toMatchObject({ type: 'clarification', code: 'LOCATION_AMBIGUOUS' });
+    expect(result.events[2]).toMatchObject({ type: 'final', sources: [{ kind: '地点', resource_id: '110105' }] });
+  });
 });

@@ -19,6 +19,7 @@ from langgraph.graph.message import add_messages
 from .amap import AmapClient, AmapError
 from .config import Settings
 from .db import ProfileRepository
+from .llm_json import invoke_json_model
 from .models import ResolvedLocation, SourceRecord, UserProfile, WeatherPlan, WeatherSnapshot
 
 
@@ -234,18 +235,18 @@ class WeatherAgent:
         today = datetime.now(self.timezone).date().isoformat()
         previous = [ResolvedLocation.model_validate(item).query for item in state.get("last_locations", [])]
         prompt = (
-            "你是中文天气助手的规划器，只输出结构化计划。今天是"
+            "你是中文天气助手的规划器。必须只输出一个 JSON 对象，不要 Markdown、解释或思考过程。"
+            "该 JSON 必须符合下方 WeatherPlan schema。今天是"
             f"{today}（Asia/Shanghai）。识别最多5个地点、实时或未来三天范围、比较和建议主题。"
             "用户明确说‘记住/以后默认’时才填写 memory_update。"
             "基础数据不支持超过三天、逐小时、历史、AQI和灾害预警，遇到这些请求填写 unsupported_reason。"
             f"默认地点：{profile.default_location.model_dump() if profile.default_location else None}；"
             f"当前对话上次地点：{previous}。缺少地点时可使用上次地点，其次使用默认地点。"
+            f"WeatherPlan JSON schema：{json.dumps(WeatherPlan.model_json_schema(), ensure_ascii=False)}"
         )
-        try:
-            structured = self.llm.with_structured_output(WeatherPlan, method="function_calling")
-            return structured.invoke([SystemMessage(content=prompt), HumanMessage(content=text)])
-        except Exception:
-            return None
+        return invoke_json_model(self.llm, WeatherPlan, [
+            SystemMessage(content=prompt), HumanMessage(content=text),
+        ])
 
     def _plan(self, state: AgentState) -> AgentState:
         _emit("plan", "running", "理解问题并制定计划")
@@ -471,7 +472,7 @@ class WeatherAgent:
             saved = state.get("memory_saved", [])
             if snapshots:
                 facts = self._fact_lines(snapshots, plan.compare)
-                answer = "天气情况如下：\n\n" + "\n".join(facts)
+                answer = "我刚帮你看了天气，整理成下面这份容易安排行程的信息：\n\n" + "\n".join(facts)
                 rainy = any(re.search(r"雨|雪|雷", item.weather) for item in snapshots)
                 cold = any(
                     value and re.fullmatch(r"-?\d+", value) and int(value) < 12
@@ -498,18 +499,12 @@ class WeatherAgent:
                 else:
                     suitability = "天气比较适合出行，可以正常安排步行和户外活动。"
                 clothing = "建议分层穿衣，早晚注意保暖。" if cold else "建议轻便透气穿着，并准备一件薄外套。" if hot else "建议按舒适层次穿衣，早晚带一件薄外套。"
-                rain_tip = "带伞或轻便雨衣，并给景区交通预留缓冲时间。" if rainy else "目前没有明显降雨提示，但景区天气可能变化，出发前再看一次实况。"
+                rain_tip = "带伞或轻便雨衣，并给景区交通预留缓冲时间。" if rainy else "目前没有明显降雨提示。"
                 wind_tip = "风力较大时避免临水、登高等暴露性活动。" if wind else "风力整体温和，适合安排常规步行和观景。"
-                answer += (
-                    "\n\n出行建议：\n"
-                    f"- 行程：{suitability}\n"
-                    f"- 穿着：{clothing}\n"
-                    f"- 雨具：{rain_tip}\n"
-                    f"- 风力：{wind_tip}"
-                )
+                answer += "\n\n出行建议：\n" + suitability + f" {clothing} {rain_tip} {wind_tip}"
                 if forecast and current:
                     answer += f"\n- 今天趋势：白天约 {forecast.day_temperature or '未知'}℃，夜间约 {forecast.night_temperature or '未知'}℃，天气为{forecast.weather}。"
-                answer += "\n\n天气信息来自高德，临近出发时建议再确认一次。告诉我游玩日期和偏好后，我也可以继续帮你安排行程。"
+                answer += "\n\n天气信息来自高德。愿你出门时刚好遇见舒服的天气。"
             elif saved:
                 answer = "好的，已记住：" + "；".join(saved) + "。之后的新对话也会使用这些偏好。"
             elif state.get("errors"):
